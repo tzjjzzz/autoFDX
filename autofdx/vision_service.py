@@ -96,6 +96,9 @@ class VisionService:
         # 赞池动态圆心（窗口归一化 [nx, ny]）；外接框尺寸与环宽比例仍沿用标定。
         self._learned_like_pool_center_norm = None
         self._last_progress_diag_log_ts = {}
+        # 诊断：每个模板最近一次 match 的最高相似度与是否命中，结构 {name: (best_val, hit)}。
+        self.last_scores = {}
+        self._cur_best_val = -1.0
 
     def reset_learned_progress_bar_regions(self):
         """切换实验或重新部署后清空赞池动态圆心（进度条始终用标定框）。"""
@@ -150,6 +153,8 @@ class VisionService:
                 best_val = max_val
                 best_center = (left + offset_x + max_loc[0] + w // 2, top + offset_y + max_loc[1] + h // 2)
 
+        if best_val > self._cur_best_val:
+            self._cur_best_val = float(best_val)
         if best_val < ac:
             return None, best_val
         return best_center, best_val
@@ -177,6 +182,13 @@ class VisionService:
         return img
 
     def match(self, template_name, ac=None, search_norm_rect=None, search_margin=None):
+        """模板匹配入口：包一层以记录最高相似度，便于失败时输出诊断分数。"""
+        self._cur_best_val = -1.0
+        result = self._match_impl(template_name, ac, search_norm_rect, search_margin)
+        self.last_scores[template_name] = (self._cur_best_val, result is not None)
+        return result
+
+    def _match_impl(self, template_name, ac=None, search_norm_rect=None, search_margin=None):
         left, top, width, height = self.window_service.get_window_region()
         template_path = self.get_template_path(template_name)
         template = self._load_template_gray_cached(template_path)
