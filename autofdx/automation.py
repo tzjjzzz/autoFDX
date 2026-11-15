@@ -401,7 +401,7 @@ class AutomationEngine:
                 if clicked:
                     self.state.log("单高潮模式：点击开始")
                     x, y = self.window_service.denormalize_point(self.config_store.data.get("safe_move_point", [0.95, 0.92]))
-                    pyautogui.moveTo(x, y)
+                    self.actions.move_mouse_to(x, y)
                 else:
                     self.state.log("单高潮模式：开始按钮点击未确认，重试")
                     sleep(0.12)
@@ -574,7 +574,7 @@ class AutomationEngine:
 
     def _move_mouse_to_safe_point_after_start(self):
         x, y = self.window_service.denormalize_point(self.config_store.data.get("safe_move_point", [0.95, 0.92]))
-        pyautogui.moveTo(x, y)
+        self.actions.move_mouse_to(x, y)
         sleep(0.2)
 
     def _click_start_until_confirmed(self, experiment_switch_enabled=False, log_prefix=""):

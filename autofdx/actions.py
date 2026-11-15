@@ -72,6 +72,8 @@ if sys.platform == "win32":
     _user32.GetForegroundWindow.restype = wintypes.HWND
     _user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
     _user32.IsIconic.argtypes = (wintypes.HWND,)
+    _user32.IsWindow.argtypes = (wintypes.HWND,)
+    _user32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
     _user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
 
     def _send_relative_move(dx: int, dy: int) -> bool:
@@ -86,8 +88,12 @@ if sys.platform == "win32":
             return False
         return True
 
-    def _send_left_click() -> None:
-        """SendInput 左键按下/抬起，比 pyautogui 更适合高频连点。"""
+    def _send_left_click(hold_sec: float = 0.0) -> None:
+        """
+        SendInput 左键按下/抬起。
+        hold_sec>0 时在按下与抬起之间保持一段时间：游戏按帧轮询鼠标状态，
+        按下/抬起落在同一帧内会被漏掉（表现为“点了没反应”）。
+        """
         for flag in (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP):
             inp = _INPUT()
             inp.type = _INPUT_MOUSE
@@ -97,6 +103,8 @@ if sys.platform == "win32":
                 err = ctypes.get_last_error()
                 log(C.SYS003, sent=sent, err=err, kind="click")
                 return
+            if flag == _MOUSEEVENTF_LEFTDOWN and hold_sec > 0:
+                sleep(hold_sec)
 
     def _send_wheel(delta: int) -> bool:
         """
@@ -144,7 +152,7 @@ else:
         pyautogui.moveRel(dx, dy)
         return True
 
-    def _send_left_click() -> None:
+    def _send_left_click(hold_sec: float = 0.0) -> None:
         pyautogui.leftClick()
 
 
@@ -167,6 +175,130 @@ def scroll_down_by_units(total_units, notch_pause_sec=0.04):
     return notches
 
 
+class RobustInput:
+    """
+    Windows 下的可靠输入后端（供 GameActions._inp() 返回）。
+
+    pyautogui 的 keybd_event/mouse_event 是“瞬发”的：按下抬起同帧、不带真实鼠标移动事件、
+    也不关心键盘焦点在哪，游戏经常漏掉。这里统一做到：
+    1) 每次注入前确保游戏窗口在前台（首次启动时焦点还在悬浮窗）；
+    2) 移动鼠标时补发真实的相对移动事件，让游戏刷新悬停/射线；
+    3) 点击、按键都带按住时长，保证至少跨过一帧；
+    4) 滚轮按整格(120)发送。
+    """
+
+    CLICK_HOLD_SEC = 0.05
+    KEY_HOLD_SEC = 0.06
+
+    def __init__(self, hwnd_getter):
+        self._hwnd_getter = hwnd_getter
+        self._hwnd = None
+        self._hwnd_t = 0.0
+
+    # --- 焦点 ---
+    def _game_hwnd(self):
+        now = monotonic()
+        if self._hwnd and (now - self._hwnd_t) < 2.0 and _user32.IsWindow(self._hwnd):
+            return self._hwnd
+        try:
+            self._hwnd = self._hwnd_getter()
+        except Exception:
+            self._hwnd = None
+        self._hwnd_t = now
+        return self._hwnd
+
+    def ensure_focus(self, settle_sec=0.2):
+        """游戏已在前台则几乎零开销；否则置前并等待 settle_sec。"""
+        hwnd = self._game_hwnd()
+        if not hwnd:
+            return False
+        try:
+            if _user32.GetForegroundWindow() == hwnd:
+                return True
+        except Exception:
+            return False
+        ok = _bring_window_to_front(hwnd)
+        sleep(max(0.0, float(settle_sec)))
+        return bool(ok)
+
+    # --- 鼠标 ---
+    def nudge(self, px=3):
+        """原地来回抖动 px 像素，产生真实移动事件但不改变最终位置。"""
+        _send_relative_move(int(px), 0)
+        sleep(0.02)
+        _send_relative_move(-int(px), 0)
+        sleep(0.02)
+
+    def move_to(self, x, y):
+        self.ensure_focus()
+        x, y = int(x), int(y)
+        _user32.SetCursorPos(x, y)
+        sleep(0.01)
+        self.nudge(2)
+        _user32.SetCursorPos(x, y)  # 抖动后校正到精确位置
+        sleep(0.02)
+
+    def move_rel(self, dx, dy=0, duration=0.0):
+        dx, dy = int(dx), int(dy)
+        steps = max(1, int(float(duration) / 0.01)) if duration and duration > 0 else 1
+        done_x = done_y = 0
+        for i in range(1, steps + 1):
+            tx = round(dx * i / steps)
+            ty = round(dy * i / steps)
+            sx, sy = tx - done_x, ty - done_y
+            if sx or sy:
+                _send_relative_move(sx, sy)
+            done_x, done_y = tx, ty
+            if duration and duration > 0:
+                sleep(float(duration) / steps)
+
+    def left_click(self, hold=None):
+        self.ensure_focus()
+        _send_left_click(self.CLICK_HOLD_SEC if hold is None else float(hold))
+
+    def click(self, clicks=1, interval=0.08):
+        for i in range(max(1, int(clicks))):
+            self.left_click()
+            if i < clicks - 1:
+                sleep(max(0.0, float(interval)))
+
+    def scroll(self, amount, x=None, y=None):
+        """amount 为原始滚轮量（正=向上，负=向下）；高频调用，不做焦点检查。"""
+        if x is not None and y is not None:
+            self.move_to(x, y)
+        _send_wheel(int(amount))
+
+    # --- 键盘 ---
+    def press(self, key, hold=None):
+        self.ensure_focus()
+        hold_sec = self.KEY_HOLD_SEC if hold is None else float(hold)
+        try:
+            keyboard.press(key)
+            sleep(max(0.01, hold_sec))
+            keyboard.release(key)
+            return True
+        except Exception:
+            try:
+                pyautogui.keyDown(key)
+                sleep(max(0.01, hold_sec))
+                pyautogui.keyUp(key)
+                return True
+            except Exception:
+                return False
+
+    def press_after_delay(self, key, delay_sec=0.0, abort_check=None, repeat=1, interval=0.0):
+        if delay_sec and delay_sec > 0:
+            sleep(float(delay_sec))
+        for i in range(max(1, int(repeat))):
+            if abort_check and abort_check():
+                return False
+            self.press(key)
+            if i < repeat - 1:
+                sleep(max(0.0, float(interval)))
+        log(C.SA004, n=repeat, interval=interval)
+        return True
+
+
 class GameActions:
     """负责点击与滚动行为，不关心识别细节。"""
 
@@ -182,15 +314,49 @@ class GameActions:
         self.window_service = window_service
         self.vision_service = vision_service
         self._last_special_action_red_info = {}
+        self._robust_input = None
+
+    def _game_hwnd_or_none(self):
+        try:
+            return getattr(self.window_service.get_game_window(), "_hWnd", None)
+        except Exception:
+            return None
 
     def _inp(self):
-        return None
+        """Windows 下返回可靠输入后端；其它平台返回 None（回退 pyautogui）。"""
+        if sys.platform != "win32":
+            return None
+        if self._robust_input is None:
+            self._robust_input = RobustInput(self._game_hwnd_or_none)
+        return self._robust_input
+
+    def move_mouse_to(self, x, y):
+        """统一的“移动鼠标到绝对坐标”入口（供 automation.py 使用）。"""
+        inp = self._inp()
+        if inp is not None:
+            inp.move_to(x, y)
+        else:
+            pyautogui.moveTo(x, y)
+
+    def _placement_click(self):
+        """
+        部署/放置用的左键：先聚焦、原地抖动一下让游戏刷新悬停（放置预览/射线），
+        稍等后带按住时长点击。
+        """
+        inp = self._inp()
+        if inp is not None:
+            inp.ensure_focus()
+            inp.nudge(3)
+            sleep(0.12)
+            inp.left_click(hold=0.08)
+        else:
+            pyautogui.leftClick()
 
     def _move_rel(self, dx: int, dy: int) -> bool:
         return _send_relative_move(dx, dy)
 
     def _left_click_sendinput(self) -> None:
-        _send_left_click()
+        _send_left_click(0.03)
 
     def reset_dynamic_learned_regions(self):
         """清空赞池圆心等动态区域（特殊动作判红始终用用户标定框）。"""
@@ -451,52 +617,22 @@ class GameActions:
         return True
 
     def focus_game_window(self, settle_sec=0.25):
-        """
-        确保游戏窗口为前台窗口。
-
-        首次启动时键盘焦点通常还在 autoFDX 悬浮窗上，此时按 E 会被悬浮窗吞掉，
-        游戏收不到按键；后续流程因为先点击过游戏画面，焦点已经在游戏里，所以没问题。
-        """
-        if sys.platform != "win32":
+        """确保游戏窗口为前台窗口（非 Windows 恒为 False）。"""
+        inp = self._inp()
+        if inp is None:
             return False
-        try:
-            win = self.window_service.get_game_window()
-            hwnd = getattr(win, "_hWnd", None)
-            if not hwnd:
-                return False
-            already = _user32.GetForegroundWindow() == hwnd
-            ok = True if already else _bring_window_to_front(hwnd)
-            if not already:
-                sleep(max(0.0, float(settle_sec)))
-            return bool(ok)
-        except Exception:
-            return False
-
-    def _tap_key_held(self, key, hold_sec=0.06):
-        """
-        带按住时长的按键：按下 -> 保持 hold_sec -> 抬起。
-        瞬时 press_and_release 容易落在两帧之间被游戏漏掉；
-        这里优先用 keyboard 库（SendInput 扫描码，与已验证可用的“按 1”同路径），
-        失败再回退 pyautogui。
-        """
-        try:
-            keyboard.press(key)
-            sleep(max(0.01, float(hold_sec)))
-            keyboard.release(key)
-            return True
-        except Exception:
-            try:
-                pyautogui.keyDown(key)
-                sleep(max(0.01, float(hold_sec)))
-                pyautogui.keyUp(key)
-                return True
-            except Exception:
-                return False
+        return bool(inp.ensure_focus(settle_sec))
 
     def press_experiment_switch_hotkey(self):
-        """实验切换入口热键：先聚焦游戏窗口，再按住 E 约 60ms。"""
-        focused = self.focus_game_window()
-        ok = self._tap_key_held("e", hold_sec=0.06)
+        """实验切换入口热键：聚焦游戏窗口后按住 E。"""
+        inp = self._inp()
+        if inp is not None:
+            focused = inp.ensure_focus(0.25)
+            ok = inp.press("e")
+        else:
+            focused = False
+            pyautogui.press("e")
+            ok = True
         log(C.HK006, key="e", focused=int(bool(focused)), sent=int(bool(ok)))
         sleep(0.12)
 
@@ -603,6 +739,7 @@ class GameActions:
         使用 SendInput 底层输入让鼠标向右移动屏幕横向分辨率 1/10 的距离。
         分多小步执行以提高游戏对输入事件的识别率。
         """
+        self.focus_game_window(0.15)
         screen_w, _ = pyautogui.size()
         total_dx = screen_w // 10
         step_px = 80
@@ -691,6 +828,7 @@ class GameActions:
         max_step_px = move_cfg["max_step_px"]
         speed_multiplier = move_cfg["speed_multiplier"]
 
+        self.focus_game_window(0.15)
         screen_w, _ = pyautogui.size()
         rotation_target_dx = self._rotation_target_dx_360()
         velocity_px_per_sec = (float(rotation_target_dx) / ws) * speed_multiplier
@@ -805,7 +943,7 @@ class GameActions:
         """
         ws = max(1.0, float(timeout_sec))
         log(C.DP001, ws=ws, mode="start_recover")
-        pyautogui.leftClick()
+        self._placement_click()
         deadline = monotonic() + ws
         start_seen = False
         while monotonic() < deadline:
@@ -1230,11 +1368,7 @@ class GameActions:
         """
         ws = max(1.0, float(wait_start_sec))
         log(C.DP001, ws=ws, mode="start_only")
-        inp = self._inp()
-        if inp is not None:
-            inp.left_click()
-        else:
-            pyautogui.leftClick()
+        self._placement_click()
         if self.wait_start_button(timeout_sec=ws):
             log(C.DP002, mode="start_only")
             return True
