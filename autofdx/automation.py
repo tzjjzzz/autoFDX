@@ -102,6 +102,12 @@ class AutomationEngine:
         # True 表示“用户已按 F2，且当前已暂停；当用户恢复后，应立即调起下一实验切换”。
         # 该标记只负责“恢复后立即切换”的一次性触发，执行后会立刻清零。
         self._f2_pending_switch_after_resume = False
+        # 看门狗：实验切换模式下，若“以为在实验里”却持续停在主页（比如被多次返回误退出），
+        # 则打断当前阶段并重新走“按 E → 选卡 → 部署”。
+        self._lost_to_home_pending = False
+        self._home_watch_last_mono = 0.0
+        self._home_watch_hits = 0
+        self._main_thread_ident = None
         # 女进度条停滞监测（流程.md 第8条）：
         # 独立线程在正常运行期间持续采样 b1，如超时窗口内始终不增加则置位标志。
         self._female_bar_stall_flag = False
@@ -895,7 +901,63 @@ class AutomationEngine:
         # 从而保证“恢复后马上调起切换下一实验”。
         if self._f2_pending_switch_after_resume:
             return True
+        if self._lost_to_home_pending:
+            return True
+        if self._home_watchdog_tick():
+            return True
         return False
+
+    def _home_watchdog_tick(self):
+        """
+        ≤1Hz 的主页看门狗（只在主流程线程里被各等待循环顺带调用）。
+        条件：实验切换开启 + 脚本认为“当前实验已部署”(bootstrapped) + 连续 N 秒判定为主页。
+        满足则置位 _lost_to_home_pending，让各等待循环退出，由 loop_once 统一恢复。
+        """
+        if threading.get_ident() != self._main_thread_ident:
+            return False
+        data = self.config_store.data
+        if not bool(data.get("experiment_switch_enabled", False)) or not self._experiment_switch_bootstrapped:
+            self._home_watch_hits = 0
+            return False
+        now = monotonic()
+        if now - self._home_watch_last_mono < 1.0:
+            return False
+        self._home_watch_last_mono = now
+        try:
+            is_home, _matched, _blockers = self.vision_service.detect_home_page()
+        except Exception:
+            return False
+        if not is_home:
+            self._home_watch_hits = 0
+            return False
+        self._home_watch_hits += 1
+        try:
+            limit = max(3, int(data.get("lost_home_seconds", 10)))
+        except Exception:
+            limit = 10
+        if self._home_watch_hits >= limit:
+            self._home_watch_hits = 0
+            self._lost_to_home_pending = True
+            log(C.WD001, sec=limit)
+            return True
+        return False
+
+    def _recover_from_lost_to_home(self):
+        """被误退出到主页后：清掉“当前实验已部署”等状态，下一轮 loop_once 会重新按 E → 选卡 → 部署。"""
+        self._lost_to_home_pending = False
+        self._home_watch_hits = 0
+        self.state.set_status("疑似已退出实验：重新进入")
+        self._scroll_enabled = False
+        self._clear_scroll_command()
+        self._female_bar_monitor_active = False
+        self._special_action_monitor_active = False
+        self._experiment_switch_bootstrapped = False
+        self._experiment_panel_preopened = False
+        self._switch_after_five_on_start_pending = False
+        self._awaiting_first_start_after_redeploy = False
+        self._start_click_consecutive_failures = 0
+        self.actions.reset_dynamic_learned_regions()
+        sleep(1.0)
 
     def _maybe_auto_refill_stamina_before_start(self):
         """
@@ -1097,7 +1159,15 @@ class AutomationEngine:
                 log(C.HK003, reason="esc_loop")
             self.state.set_status("F2切换：ESC 返回中（恢复体力按钮仍可见）")
             self._press_key("esc")
-            sleep(0.38)
+            # 低帧率下界面过渡更慢：每次 ESC 后最多等 1.3s 看按钮是否消失，再决定是否再按，避免连按过头。
+            settle_deadline = monotonic() + 1.3
+            while monotonic() < settle_deadline:
+                sleep(0.1)
+                try:
+                    if self.vision_service.match("recover_stamina_button") is None:
+                        break
+                except FileNotFoundError:
+                    return
 
         log(C.HK003, reason="esc_max", n=max_extra_esc)
 
@@ -1818,6 +1888,11 @@ class AutomationEngine:
         # —— 以下为【主模式】loop_once：点赞在成功点击「再来一次」后由 _maybe_like_after_finish_main() 处理。 ——
 
         experiment_switch_enabled = bool(self.config_store.data.get("experiment_switch_enabled", False))
+        if self._lost_to_home_pending:
+            if experiment_switch_enabled:
+                self._recover_from_lost_to_home()
+                return
+            self._lost_to_home_pending = False
         # F2 一次性“恢复后切换”入口：
         # 该分支优先级最高，确保恢复后先切换，再决定是否进入主流程。
         if self._f2_pending_switch_after_resume:
@@ -2098,6 +2173,7 @@ class AutomationEngine:
             return
 
     def run_forever(self):
+        self._main_thread_ident = threading.get_ident()
         self._register_hotkeys()
         self._start_scroll_worker()
         self._start_female_bar_monitor()

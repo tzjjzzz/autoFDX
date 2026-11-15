@@ -1321,17 +1321,84 @@ class GameActions:
             log(C.SA005, err=exc)
             return False
 
+    def _pull_scroll_anchor(self):
+        """
+        滚动时鼠标停放的位置（归一化）。
+        只需鼠标落在“身体部位”标点区域内即可滚动实验列表，因此优先取身体部位标点中间的一个，
+        不再依赖单独标定的 x/y；没有身体部位标点时才回退到“拉出新实验滚动”里标定的 x/y。
+        """
+        parts = [
+            p for p in self.config.get("body_part_points", [])
+            if isinstance(p, (list, tuple)) and len(p) == 2
+        ]
+        if parts:
+            p = parts[len(parts) // 2]
+            return float(p[0]), float(p[1])
+        action = self.config.get("pull_new_experiment_scroll_action", {})
+        return float(action.get("x", 0.5)), float(action.get("y", 0.5))
+
+    def _experiment_list_norm_rect(self, margin=0.06):
+        """实验卡片网格的外接归一化矩形（用于判断列表滚动是否已停稳）。"""
+        pts = [
+            p for p in self.config.get("experiment_points", [])
+            if isinstance(p, (list, tuple)) and len(p) == 2
+        ]
+        if not pts:
+            return None
+        xs = [float(p[0]) for p in pts]
+        ys = [float(p[1]) for p in pts]
+        return (
+            max(0.0, min(xs) - margin), max(0.0, min(ys) - margin),
+            min(1.0, max(xs) + margin), min(1.0, max(ys) + margin),
+        )
+
+    def wait_experiment_list_settled(
+        self, min_wait_sec=0.6, timeout_sec=4.0, poll_sec=0.08, stable_frames=4, diff_thr=1.2
+    ):
+        """
+        滚动后等待实验列表停稳再继续：连续 stable_frames 帧之间的平均像素差 < diff_thr 视为停稳。
+        按画面而不是固定时长判断，所以游戏帧率低（如远程会话锁 30 帧）时滚动动画变慢也不会被抢跑。
+        返回 (是否停稳, 实际等待秒数)。
+        """
+        t0 = monotonic()
+        sleep(max(0.0, float(min_wait_sec)))
+        rect = self._experiment_list_norm_rect()
+        if rect is None:
+            return True, monotonic() - t0
+        prev = None
+        stable = 0
+        while monotonic() - t0 < float(timeout_sec):
+            try:
+                screen = self.vision_service.capture_screen()
+                h, w = screen.shape[:2]
+                x1, y1, x2, y2 = int(rect[0] * w), int(rect[1] * h), int(rect[2] * w), int(rect[3] * h)
+                crop = screen[y1:y2, x1:x2]
+                g = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), (96, 64), interpolation=cv2.INTER_AREA)
+                g = g.astype(np.float32)
+            except Exception:
+                sleep(max(0.01, float(poll_sec)))
+                continue
+            if prev is not None:
+                if float(np.abs(g - prev).mean()) < float(diff_thr):
+                    stable += 1
+                    if stable >= int(stable_frames):
+                        return True, monotonic() - t0
+                else:
+                    stable = 0
+            prev = g
+            sleep(max(0.01, float(poll_sec)))
+        return False, monotonic() - t0
+
     def replay_pull_new_experiment_scroll_action(self, delay_sec=1.0):
         """
-        重播“拉出新实验滚动”标定动作：
-        - 延迟 delay_sec 后执行；
-        - 先聚焦游戏窗口，再把鼠标移到标定坐标并稍等，让游戏识别悬停在列表上；
-        - 向下滚动：总量沿用标定约定（1档=10滚轮单位），但按整格(120)发送，
-          每格间隔 ~40ms，至少 1 格（原先每次只发 -10，游戏会忽略小于一格的滚轮事件）。
+        重播“拉出新实验滚动”：
+        - 延迟 delay_sec 后执行；先聚焦游戏窗口；
+        - 鼠标移到身体部位标点区域内即可（不需要点击，也不依赖单独标定的位置）；
+        - 向下滚动：总量沿用标定约定（1档=10滚轮单位），按整格(120)发送、每格间隔 ~40ms、至少 1 格；
+        - 滚完后等待实验列表画面停稳（滚动动画结束）再返回，避免紧接着点新实验卡片时列表还在动。
         """
         action = self.config.get("pull_new_experiment_scroll_action", {})
-        ax = action.get("x", 0.5)
-        ay = action.get("y", 0.5)
+        ax, ay = self._pull_scroll_anchor()
         # 兼容旧数据：若无 distance_down，则回退读取旧 distance。
         raw_distance = action.get("distance_down", action.get("distance", 0))
         try:
@@ -1345,16 +1412,13 @@ class GameActions:
             sleep(max(0.0, float(delay_sec)))
             self.focus_game_window()
             x, y = self.window_service.denormalize_point([ax, ay])
-            inp = self._inp()
-            if inp is not None:
-                inp.move_to(x, y)
-            else:
-                pyautogui.moveTo(x, y)
+            self.move_mouse_to(x, y)
             # 鼠标到位后停一下，游戏需要先收到悬停才会把滚轮交给列表。
             sleep(0.2)
             notches = scroll_down_by_units(distance * 10.0)
-            sleep(0.15)
-            log(C.SC001, x=ax, y=ay, down=distance, notches=notches)
+            settled, waited = self.wait_experiment_list_settled()
+            log(C.SC001, x=round(ax, 3), y=round(ay, 3), down=distance, notches=notches)
+            log(C.SC002, settled=int(settled), waited=round(waited, 2))
             return True
         except Exception as exc:
             log(C.SC001, ok=0, err=exc)
