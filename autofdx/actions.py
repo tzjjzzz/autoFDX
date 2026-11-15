@@ -9,7 +9,6 @@ import numpy as np
 import pyautogui
 
 from . import log_codes as C
-from .config import PROJECT_ROOT
 from .run_log import log, log_debug
 
 # ---------------------------------------------------------------------------
@@ -617,60 +616,6 @@ class GameActions:
         sleep(0.08)
         return True
 
-    def _cursor_inside_detect_regions(self, pad=0.03):
-        """当前鼠标是否压在“开始/恢复体力”模板检测区域上（遮挡会让匹配分骤降）。"""
-        try:
-            left, top, width, height = self.window_service.get_window_region()
-            cx, cy = pyautogui.position()
-            nx = (cx - left) / max(1, width)
-            ny = (cy - top) / max(1, height)
-            regions = self.config.get("template_regions", {})
-            for key in ("start", "recover_stamina_button"):
-                r = regions.get(key)
-                if isinstance(r, (list, tuple)) and len(r) == 4:
-                    if r[0] - pad <= nx <= r[2] + pad and r[1] - pad <= ny <= r[3] + pad:
-                        return True
-        except Exception:
-            pass
-        return False
-
-    def _move_cursor_off_detect_regions(self):
-        """放置完成后，如果鼠标压住了检测区域，就挪到窗口中部偏上的空白处再识别。"""
-        if not self._cursor_inside_detect_regions():
-            return False
-        try:
-            x, y = self.window_service.denormalize_point([0.5, 0.35])
-            self.move_mouse_to(x, y)
-            sleep(0.1)
-            return True
-        except Exception:
-            return False
-
-    def _log_deploy_diag(self, tag, best_start, best_recover):
-        """部署失败时：输出两个模板的最高匹配分与阈值，并保存一张游戏窗口截图。"""
-        thr = self.config.get("template_thresholds", {})
-        shot = ""
-        try:
-            d = PROJECT_ROOT / "debug_shots"
-            d.mkdir(exist_ok=True)
-            files = sorted(d.glob("deploy_fail_*.png"))
-            for old in files[:-19]:
-                old.unlink(missing_ok=True)
-            path = d / f"deploy_fail_{int(monotonic() * 1000)}.png"
-            cv2.imwrite(str(path), self.vision_service.capture_screen())
-            shot = path.name
-        except Exception:
-            pass
-        log(
-            C.DP004,
-            tag=tag,
-            start_best=round(best_start, 3),
-            start_thr=thr.get("start", "-"),
-            recover_best=round(best_recover, 3),
-            recover_thr=thr.get("recover_stamina_button", "-"),
-            shot=shot,
-        )
-
     def focus_game_window(self, settle_sec=0.25):
         """确保游戏窗口为前台窗口（非 Windows 恒为 False）。"""
         inp = self._inp()
@@ -965,13 +910,10 @@ class GameActions:
             _send_dx_micro(rem)
         if cumulative_dx < rotation_target_dx:
             log(C.MV002, reason="under_rotate", ws=ws, dx=cumulative_dx, target=rotation_target_dx)
-        ls = self.vision_service.last_scores
         if start_seen:
             log(C.MV002, reason="start_no_recover", ws=ws)
-            self._log_deploy_diag("mv_no_recover", ls.get("start", (-1.0, False))[0], ls.get("recover_stamina_button", (-1.0, False))[0])
             return True, False
         log(C.MV002, reason="no_start", ws=ws)
-        self._log_deploy_diag("mv_no_start", ls.get("start", (-1.0, False))[0], ls.get("recover_stamina_button", (-1.0, False))[0])
         return False, False
 
     def has_recover_stamina_button(self, timeout_sec=2.0, poll_interval_sec=0.06):
@@ -993,32 +935,20 @@ class GameActions:
     def deploy_and_check_start_recover(self, timeout_sec=2.0, poll_interval_sec=0.06):
         """
         尝试部署并在同一时间窗口内同时检测“开始按钮 + 恢复体力按钮”：
-        - 先左键尝试部署（聚焦 + 抖动 + 按住点击）；
-        - 若鼠标压在检测区域上，先挪开，避免遮挡导致匹配分下降；
-        - 检测窗口至少 4 秒（命中即返回，所以只影响失败时的耗时；部署动画偏慢时不再误判）；
-        - 失败时输出两个模板的最高匹配分并保存截图（DP004），便于定位是哪个模板没匹配上。
-        返回：
-          1) (True, True)  开始 + 恢复体力同时出现
-          2) (True, False) 只出现过开始按钮
-          3) (False, False) 开始按钮始终未出现
+        - 先左键尝试部署；
+        - 在 timeout_sec 内循环判断：
+          1) 若两者同时存在 -> (start_seen=True, both_ready=True)
+          2) 若只出现过开始按钮 -> (start_seen=True, both_ready=False)
+          3) 若开始按钮始终未出现 -> (start_seen=False, both_ready=False)
         """
-        ws = max(4.0, float(timeout_sec))
+        ws = max(1.0, float(timeout_sec))
         log(C.DP001, ws=ws, mode="start_recover")
         self._placement_click()
-        self._move_cursor_off_detect_regions()
         deadline = monotonic() + ws
         start_seen = False
-        best_start = -1.0
-        best_recover = -1.0
         while monotonic() < deadline:
             has_start = bool(self.ready_to_start())
-            best_start = max(best_start, self.vision_service.last_scores.get("start", (-1.0, False))[0])
-            try:
-                has_recover = self.vision_service.match("recover_stamina_button") is not None
-            except FileNotFoundError:
-                has_recover = False
-                log(C.DP004, tag="recover_template_missing")
-            best_recover = max(best_recover, self.vision_service.last_scores.get("recover_stamina_button", (-1.0, False))[0])
+            has_recover = self.vision_service.match("recover_stamina_button") is not None
             if has_start:
                 start_seen = True
             if has_start and has_recover:
@@ -1028,10 +958,8 @@ class GameActions:
 
         if start_seen:
             log(C.DP003, reason="no_recover", ws=ws)
-            self._log_deploy_diag("no_recover", best_start, best_recover)
             return True, False
         log(C.DP003, reason="no_start", ws=ws)
-        self._log_deploy_diag("no_start", best_start, best_recover)
         return False, False
 
     def _capture_calibration_region_bgr(self, key):
