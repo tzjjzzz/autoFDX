@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import pyautogui
 
+from .actions import scroll_down_by_units
 from .config import APP_VERSION
 from .config import CALIBRATION_ITEMS
 from .config import PROJECT_ROOT
@@ -939,16 +940,9 @@ class CalibrationOverlay:
             abs_x = int(self.game_left + ax * self.game_width)
             abs_y = int(self.game_top + ay * self.game_height)
             pyautogui.moveTo(abs_x, abs_y)
-            # 新比例：1档=10滚轮单位，支持小数档位（如 8.5 -> 85 单位）。
-            total_units = max(0, int(round(distance * 10.0)))
-            full_steps = total_units // 10
-            remain_units = total_units % 10
-            for _ in range(full_steps):
-                pyautogui.scroll(-10)
-                # 提速 2 倍：每步滚动间隔由 10ms 降到 5ms。
-                sleep(0.005)
-            if remain_units > 0:
-                pyautogui.scroll(-remain_units)
+            # 鼠标到位后稍等，让游戏收到悬停；再按整格滚轮发送（1档=10滚轮单位）。
+            sleep(0.2)
+            scroll_down_by_units(distance * 10.0)
         # 标定完成后不自动恢复，等待用户点“继续运行”再进入自动流程。
         self.state.calibration_updated = True
         self.state.manual_pause = True

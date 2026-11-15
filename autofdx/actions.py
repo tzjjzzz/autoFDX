@@ -22,6 +22,8 @@ if sys.platform == "win32":
     _MOUSEEVENTF_MOVE = 0x0001
     _MOUSEEVENTF_LEFTDOWN = 0x0002
     _MOUSEEVENTF_LEFTUP = 0x0004
+    _MOUSEEVENTF_WHEEL = 0x0800
+    _WHEEL_DELTA = 120
 
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -67,6 +69,10 @@ if sys.platform == "win32":
     _INPUT_SIZE = ctypes.sizeof(_INPUT)
     _user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
     _user32.SendInput.restype = wintypes.UINT
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    _user32.IsIconic.argtypes = (wintypes.HWND,)
+    _user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
 
     def _send_relative_move(dx: int, dy: int) -> bool:
         """通过 SendInput 注入一次相对鼠标移动事件。"""
@@ -91,7 +97,48 @@ if sys.platform == "win32":
                 err = ctypes.get_last_error()
                 log(C.SYS003, sent=sent, err=err, kind="click")
                 return
+
+    def _send_wheel(delta: int) -> bool:
+        """
+        SendInput 注入一次滚轮事件。
+
+        pyautogui.scroll 在 Windows 上把参数原样当作 wheelData；游戏通常按
+        WHEEL_DELTA(120) 为一格解析，小于 120 的事件（如 -10）会被忽略，
+        因此实验列表需要以「整格」为单位发送。delta<0 为向下滚动。
+        """
+        inp = _INPUT()
+        inp.type = _INPUT_MOUSE
+        # mouseData 为 DWORD，负数需按补码传入。
+        inp.u.mi = _MOUSEINPUT(0, 0, int(delta) & 0xFFFFFFFF, _MOUSEEVENTF_WHEEL, 0, _ULONG_PTR(0))
+        sent = _user32.SendInput(1, ctypes.byref(inp), _INPUT_SIZE)
+        if sent != 1:
+            err = ctypes.get_last_error()
+            log(C.SYS003, sent=sent, err=err, kind="wheel")
+            return False
+        return True
+
+    def _bring_window_to_front(hwnd) -> bool:
+        """把游戏窗口置前并返回是否成功（用 Alt 轻点绕过前台锁）。"""
+        try:
+            if _user32.GetForegroundWindow() == hwnd:
+                return True
+            if _user32.IsIconic(hwnd):
+                _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            _user32.keybd_event(0x12, 0, 0, 0)  # Alt down
+            _user32.keybd_event(0x12, 0, 2, 0)  # Alt up
+            _user32.SetForegroundWindow(hwnd)
+            sleep(0.15)
+            return _user32.GetForegroundWindow() == hwnd
+        except Exception:
+            return False
 else:
+    def _send_wheel(delta: int) -> bool:
+        pyautogui.scroll(int(delta))
+        return True
+
+    def _bring_window_to_front(hwnd) -> bool:
+        return False
+
     def _send_relative_move(dx: int, dy: int) -> bool:
         """非 Windows 回退：用 pyautogui 模拟。"""
         pyautogui.moveRel(dx, dy)
@@ -99,6 +146,25 @@ else:
 
     def _send_left_click() -> None:
         pyautogui.leftClick()
+
+
+def scroll_down_by_units(total_units, notch_pause_sec=0.04):
+    """
+    向下滚动 total_units 个「滚轮单位」（标定约定：1档=10单位）。
+    以整格(WHEEL_DELTA=120)发送、至少 1 格，返回实际发送的格数。
+    标定确认时的回放与运行时重播共用此函数，保证行为一致。
+    """
+    try:
+        units = max(0, int(round(float(total_units))))
+    except Exception:
+        units = 0
+    if units <= 0:
+        return 0
+    notches = max(1, int(round(units / 120.0)))
+    for _ in range(notches):
+        _send_wheel(-120)
+        sleep(max(0.0, float(notch_pause_sec)))
+    return notches
 
 
 class GameActions:
@@ -384,13 +450,54 @@ class GameActions:
         sleep(0.08)
         return True
 
+    def focus_game_window(self, settle_sec=0.25):
+        """
+        确保游戏窗口为前台窗口。
+
+        首次启动时键盘焦点通常还在 autoFDX 悬浮窗上，此时按 E 会被悬浮窗吞掉，
+        游戏收不到按键；后续流程因为先点击过游戏画面，焦点已经在游戏里，所以没问题。
+        """
+        if sys.platform != "win32":
+            return False
+        try:
+            win = self.window_service.get_game_window()
+            hwnd = getattr(win, "_hWnd", None)
+            if not hwnd:
+                return False
+            already = _user32.GetForegroundWindow() == hwnd
+            ok = True if already else _bring_window_to_front(hwnd)
+            if not already:
+                sleep(max(0.0, float(settle_sec)))
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _tap_key_held(self, key, hold_sec=0.06):
+        """
+        带按住时长的按键：按下 -> 保持 hold_sec -> 抬起。
+        瞬时 press_and_release 容易落在两帧之间被游戏漏掉；
+        这里优先用 keyboard 库（SendInput 扫描码，与已验证可用的“按 1”同路径），
+        失败再回退 pyautogui。
+        """
+        try:
+            keyboard.press(key)
+            sleep(max(0.01, float(hold_sec)))
+            keyboard.release(key)
+            return True
+        except Exception:
+            try:
+                pyautogui.keyDown(key)
+                sleep(max(0.01, float(hold_sec)))
+                pyautogui.keyUp(key)
+                return True
+            except Exception:
+                return False
+
     def press_experiment_switch_hotkey(self):
-        """实验切换入口热键：按下 E。"""
-        inp = self._inp()
-        if inp is not None:
-            inp.press("e")
-        else:
-            pyautogui.press("e")
+        """实验切换入口热键：先聚焦游戏窗口，再按住 E 约 60ms。"""
+        focused = self.focus_game_window()
+        ok = self._tap_key_held("e", hold_sec=0.06)
+        log(C.HK006, key="e", focused=int(bool(focused)), sent=int(bool(ok)))
         sleep(0.12)
 
     def click_body_part(self, index_1based):
@@ -1080,7 +1187,9 @@ class GameActions:
         """
         重播“拉出新实验滚动”标定动作：
         - 延迟 delay_sec 后执行；
-        - 在标定记录的坐标处，向下滚动记录距离。
+        - 先聚焦游戏窗口，再把鼠标移到标定坐标并稍等，让游戏识别悬停在列表上；
+        - 向下滚动：总量沿用标定约定（1档=10滚轮单位），但按整格(120)发送，
+          每格间隔 ~40ms，至少 1 格（原先每次只发 -10，游戏会忽略小于一格的滚轮事件）。
         """
         action = self.config.get("pull_new_experiment_scroll_action", {})
         ax = action.get("x", 0.5)
@@ -1096,27 +1205,18 @@ class GameActions:
             return False
         try:
             sleep(max(0.0, float(delay_sec)))
+            self.focus_game_window()
             x, y = self.window_service.denormalize_point([ax, ay])
             inp = self._inp()
             if inp is not None:
                 inp.move_to(x, y)
             else:
                 pyautogui.moveTo(x, y)
-            total_units = max(0, int(round(distance * 10.0)))
-            full_steps = total_units // 10
-            remain_units = total_units % 10
-            for _ in range(full_steps):
-                if inp is not None:
-                    inp.scroll(-10, x, y)
-                else:
-                    pyautogui.scroll(-10)
-                sleep(0.005)
-            if remain_units > 0:
-                if inp is not None:
-                    inp.scroll(-remain_units, x, y)
-                else:
-                    pyautogui.scroll(-remain_units)
-            log(C.SC001, x=ax, y=ay, down=distance)
+            # 鼠标到位后停一下，游戏需要先收到悬停才会把滚轮交给列表。
+            sleep(0.2)
+            notches = scroll_down_by_units(distance * 10.0)
+            sleep(0.15)
+            log(C.SC001, x=ax, y=ay, down=distance, notches=notches)
             return True
         except Exception as exc:
             log(C.SC001, ok=0, err=exc)
