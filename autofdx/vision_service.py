@@ -670,36 +670,32 @@ class VisionService:
         return has_heart and (has_ring or has_blue)
 
     def detect_home_page(self):
-        """
-        主页判定（先决条件优先）：
-        1) 必须先 positive 检测到赞池 UI；未检测到则一律非主页，不再探测其它模板；
-        2) 赞池可见后，再确认除赞池外所有流程模板均未识别 → 主页。
-        返回 (is_home, matched_templates, blockers)。
-        """
-        if not self.is_like_pool_present():
-            return False, [], ["未检测到赞池"]
-
+        """Positive flow evidence takes priority; missing home UI is not a scene."""
         matched = self.probe_flow_templates()
         if matched:
             blockers = [HOME_PAGE_TEMPLATE_SHORT.get(k, k) for k in matched]
             return False, matched, blockers
-
-        return True, [], []
+        if self.is_like_pool_present():
+            return True, [], []
+        return False, [], ["未检测到主页或实验内标志"]
 
     @staticmethod
     def format_home_page_scene_label(is_home, matched, blockers=None):
-        """供 UI 展示的页面状态文案。"""
+        """Only report an experiment when a positive in-experiment marker matched."""
         if is_home:
             return "主页"
-        blockers = list(blockers or [])
-        if blockers:
-            if len(blockers) <= 3:
-                return f"非主页({','.join(blockers)})"
-            return f"非主页({','.join(blockers[:3])}等{len(blockers)}项)"
-        labels = [HOME_PAGE_TEMPLATE_SHORT.get(k, k) for k in (matched or [])]
-        if len(labels) <= 3:
-            return f"非主页({','.join(labels)})"
-        return f"非主页({','.join(labels[:3])}等{len(labels)}项)"
+        experiment_markers = {"start", "finish", "cum1", "cum2", "cum_single",
+                              "recover_stamina_button", "sensitive_progress_bar",
+                              "special_action_button"}
+        matched = list(matched or [])
+        labels = [HOME_PAGE_TEMPLATE_SHORT.get(k, k) for k in matched]
+        summary = ",".join(labels[:3])
+        if any(k in experiment_markers for k in matched):
+            return f"实验内({summary})"
+        if matched:
+            return f"非主页({summary})"
+        detail = ",".join(list(blockers or [])[:3])
+        return f"页面未知({detail})" if detail else "页面未知"
 
 
 def sample_hsv_profile(crop_bgr):

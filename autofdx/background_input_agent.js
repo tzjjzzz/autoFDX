@@ -73,11 +73,80 @@ for (const name of ['DispatchMessageW', 'DispatchMessageA']) {
         }
     });
 }
+
+// Synthetic HRAWINPUT tokens are owned by this agent, never physical HID input.
+// Only our tokens are handled here; genuine OS raw input passes through unchanged.
+const rawPackets = new Map();
+const rawStats = {queued:0, sizeQueries:0, dataReads:0, expired:0, cancelled:0};
+const rawHeaderSize = Process.pointerSize === 8 ? 24 : 16;
+const rawPacketSize = rawHeaderSize + 24;
+const rawAddress = u.getExportByName('GetRawInputData');
+const originalRaw = new NativeFunction(rawAddress, 'uint', ['pointer','uint','pointer','pointer','uint']);
+function pruneRaw() {
+    const now = Date.now();
+    for (const [key, row] of rawPackets) {
+        if (now-row.created>5000) {
+            if (!row.read) rawStats.expired++;
+            rawPackets.delete(key);
+        }
+    }
+}
+const rawCallback = new NativeCallback(function(handle, command, data, size, headerSize) {
+    const row = rawPackets.get(handle.toString());
+    if (!row) return originalRaw(handle, command, data, size, headerSize);
+    if (size.isNull() || headerSize !== rawHeaderSize) {
+        this.lastError = 87;
+        return 0xffffffff;
+    }
+    const needed = command === 0x10000003 ? rawPacketSize : command === 0x10000005 ? rawHeaderSize : 0;
+    if (!needed) { this.lastError=87;return 0xffffffff; }
+    if (data.isNull()) {
+        size.writeU32(needed);rawStats.sizeQueries++;return 0;
+    }
+    if (size.readU32()<needed) {
+        size.writeU32(needed);this.lastError=122;return 0xffffffff;
+    }
+    data.writeByteArray(row.buffer.readByteArray(needed));
+    size.writeU32(needed);
+    if(command===0x10000003) {
+        if(!row.read)rawStats.dataReads++;
+        row.read=true;
+    }
+    return needed;
+}, 'uint', ['pointer','uint','pointer','pointer','uint']);
+callbacks.push(rawCallback);
+Interceptor.replace(rawAddress, rawCallback);
+
 rpc.exports = {
     configure(hwnd) { target = ptr(hwnd); enabled = false; needsActivation = true; },
     prepare(x, y) {
         xy = {x:x, y:y}; enabled = true;
         return needsActivation;
     },
-    stop() { enabled = false; captures.clear(); }
+    queueRaw(dx, dy) {
+        if(!enabled)throw new Error('input bridge is not armed');
+        if(!Number.isInteger(dx)||!Number.isInteger(dy)||Math.abs(dx)>2147483647||Math.abs(dy)>2147483647)
+            throw new Error('invalid relative delta');
+        pruneRaw();
+        // Remove consumed packets first, retaining unread packets until timeout.
+        if(rawPackets.size>=128)for(const [key,row] of rawPackets)if(row.read)rawPackets.delete(key);
+        if(rawPackets.size>=128)throw new Error('Raw Input queue not being consumed; camera delivery stopped');
+        const buffer=Memory.alloc(rawPacketSize);
+        buffer.writeByteArray(new Uint8Array(rawPacketSize).buffer);
+        buffer.writeU32(0); // RIM_TYPEMOUSE
+        buffer.add(4).writeU32(rawPacketSize);
+        // hDevice = NULL; wParam = RIM_INPUTSINK (background).
+        buffer.add(8+Process.pointerSize).writePointer(ptr(1));
+        const mouse=buffer.add(rawHeaderSize);
+        mouse.writeU16(0); // MOUSE_MOVE_RELATIVE
+        mouse.add(12).writeS32(dx);
+        mouse.add(16).writeS32(dy);
+        const token=buffer.toString();
+        rawPackets.set(token,{buffer:buffer,created:Date.now(),read:false});
+        rawStats.queued++;
+        return token;
+    },
+    cancelRaw(token) { if(rawPackets.delete(token))rawStats.cancelled++; },
+    rawStatus() { pruneRaw();return Object.assign({pending:Array.from(rawPackets.values()).filter(r=>!r.read).length},rawStats); },
+    stop() { enabled = false; captures.clear();rawPackets.clear(); }
 };

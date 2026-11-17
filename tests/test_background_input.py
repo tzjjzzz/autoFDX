@@ -43,6 +43,8 @@ class FakeScript:
         self.loaded = self.unloaded = self.stopped = False
         self.positions = []
         self.needs_activation = True
+        self.raw = []
+        self.cancelled = []
         self.exports_sync = self
 
     def on(self, event, callback): self.callback = callback
@@ -53,6 +55,11 @@ class FakeScript:
         result = self.needs_activation
         self.needs_activation = False
         return result
+    def queue_raw(self, dx, dy):
+        self.raw.append((dx, dy))
+        return '0x123456'
+    def cancel_raw(self, token): self.cancelled.append(token)
+    def raw_status(self): return {'queued': len(self.raw), 'dataReads': 0, 'pending': len(self.raw)}
     def stop(self): self.stopped = True
     def unload(self): self.unloaded = True
 
@@ -272,6 +279,24 @@ class BackgroundInputTests(unittest.TestCase):
                 self.assertTrue(self.sessions[0].detached)
                 service.shutdown_input()
                 with self.assertRaises(RuntimeError): service.get_input()
+
+    def test_camera_uses_relative_raw_packet_without_moving_ui_cursor(self):
+        self.backend.move_to(130, 240)
+        self.api.messages.clear()
+        self.backend.camera_move_rel(5000, -20)
+        self.assertEqual(self.api.messages, [(10, 0xff, 1, 0x123456)])
+        self.assertEqual(self.sessions[0].script.raw, [(5000, -20)])
+        self.assertEqual(self.backend._position, (30, 40))
+        self.assertEqual(self.backend.camera_status()['queued'], 1)
+
+    def test_camera_failed_post_cancels_queued_token(self):
+        self.api.failure = 0xff
+        with self.assertRaises(OSError): self.backend.camera_move_rel(10, 0)
+        self.assertEqual(self.sessions[0].script.cancelled, ['0x123456'])
+
+    def test_camera_zero_delta_does_not_attach(self):
+        self.backend.camera_move_rel(0, 0)
+        self.assertFalse(self.sessions)
 
     def test_signed_coordinates_and_named_keys(self):
         self.assertEqual(packed_point(-1, -2), 0xfffeffff)

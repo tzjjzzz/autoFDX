@@ -227,6 +227,27 @@ class BackgroundInput:
                     sleep(duration / steps)
         return True
 
+    def camera_move_rel(self, dx, dy=0):
+        """Queue a target-only WM_INPUT relative mouse packet, not UI motion."""
+        dx, dy = int(dx), int(dy)
+        if not dx and not dy:
+            return True
+        with self._lock:
+            hwnd = self._prepare()
+            token = self._script.exports_sync.queue_raw(dx, dy)
+            try:
+                self._api.post(hwnd, 0x00ff, 1, int(token, 16))
+            except BaseException:
+                self._script.exports_sync.cancel_raw(token)
+                raise
+        return True
+
+    def camera_status(self):
+        with self._lock:
+            if self._script is None:
+                return {"queued": 0, "dataReads": 0, "pending": 0}
+            return self._script.exports_sync.raw_status()
+
     def nudge(self, px=3):
         with self._lock:
             self._ensure()

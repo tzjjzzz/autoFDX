@@ -87,7 +87,7 @@ class GameActions:
     def _move_rel(self, dx: int, dy: int) -> bool:
         inp = self._inp()
         if inp is not None:
-            return inp.move_rel(dx, dy)
+            return inp.camera_move_rel(dx, dy)
         pyautogui.moveRel(dx, dy)
         return True
 
