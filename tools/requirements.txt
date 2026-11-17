@@ -25,3 +25,6 @@ keyboard>=0.13.5
 
 # Window-targeted background input bridge (Windows only)
 frida>=17.0,<18; sys_platform == "win32"
+
+# HWND capture: occlusion-independent frames, no desktop screenshot fallback
+windows-capture>=2.0.1,<3; sys_platform == "win32"

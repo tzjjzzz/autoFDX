@@ -98,7 +98,7 @@ class BackgroundInputTests(unittest.TestCase):
     def test_activation_then_click_press_release(self):
         self.backend.move_to(130, 240)
         self.backend.left_click()
-        self.assertEqual([m[1] for m in self.api.messages], [0x1c, 0x200, 0x200, 0x201, 0x202])
+        self.assertEqual([m[1] for m in self.api.messages], [0x1c, 0x200, 0x1c, 0x200, 0x201, 0x202])
         self.assertEqual(self.api.messages[-2][2], 1)
         self.assertEqual(self.api.messages[-1][2], 0)
 
@@ -297,6 +297,31 @@ class BackgroundInputTests(unittest.TestCase):
     def test_camera_zero_delta_does_not_attach(self):
         self.backend.camera_move_rel(0, 0)
         self.assertFalse(self.sessions)
+
+    def test_click_refreshes_activation_after_unobserved_manual_focus_cycle(self):
+        self.backend.left_click()
+        self.api.messages.clear()
+        # Simulate a full user focus-in/focus-out between backend actions.
+        # Even without a recorded transition or dirty flag, click re-arms Slate.
+        self.sessions[0].script.needs_activation = False
+        self.backend.left_click()
+        messages=[m[1] for m in self.api.messages]
+        self.assertEqual(messages, [0x1c, 0x200, 0x201, 0x202])
+
+    def test_observed_foreground_exit_rearms_for_keyboard(self):
+        self.api.fg = 10
+        self.backend.press('e')
+        self.api.messages.clear()
+        self.api.fg = 999
+        self.backend.press('e')
+        self.assertEqual(self.api.messages[0][1:3], (0x1c, 1))
+
+    def test_foreground_click_does_not_spam_activation(self):
+        self.api.fg = 10
+        self.backend.left_click()
+        self.api.messages.clear()
+        self.backend.left_click()
+        self.assertEqual([m[1] for m in self.api.messages], [0x200, 0x201, 0x202])
 
     def test_signed_coordinates_and_named_keys(self):
         self.assertEqual(packed_point(-1, -2), 0xfffeffff)

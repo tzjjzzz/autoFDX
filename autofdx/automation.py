@@ -2,6 +2,8 @@ import random
 import threading
 from time import monotonic, sleep, time
 
+from .window_capture import CaptureUnavailable
+
 import keyboard
 import pyautogui
 
@@ -196,6 +198,12 @@ class AutomationEngine:
                 is_home, matched, blockers
             )
             self.state.scene_matched_templates = list(matched)
+        except CaptureUnavailable as exc:
+            label = f"截图异常: {exc}"
+            if self.state.scene_label != label:
+                log(C.SYS001, err=exc)
+            self.state.scene_label = label
+            self.state.scene_matched_templates = []
         except Exception:
             self.state.scene_label = "页面未知"
 

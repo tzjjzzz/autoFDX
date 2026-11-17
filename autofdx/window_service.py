@@ -15,6 +15,9 @@ class WindowService:
         self._input = None
         self._input_lock = threading.RLock()
         self._input_shutdown = False
+        self._capture = None
+        self._capture_lock = threading.RLock()
+        self._capture_shutdown = False
 
     @property
     def config(self):
@@ -78,3 +81,21 @@ class WindowService:
                 yield self.get_input()
             finally:
                 self.close_input()
+
+    def screenshot(self, region=None):
+        """PIL RGB image in existing screen/window coordinates, captured by HWND."""
+        if sys.platform != "win32":
+            return pyautogui.screenshot(region=region or self.get_window_region())
+        with self._capture_lock:
+            if self._capture_shutdown:
+                raise RuntimeError("Capture service is shut down")
+            if self._capture is None:
+                from .window_capture import WindowCapture
+                self._capture = WindowCapture(lambda: self.get_game_window()._hWnd)
+            return self._capture.screenshot(region=region)
+
+    def shutdown_capture(self):
+        with self._capture_lock:
+            self._capture_shutdown = True
+            if self._capture is not None:
+                self._capture.shutdown()

@@ -828,7 +828,7 @@ class CalibrationOverlay:
             sleep(0.05)
             screenshot = cv2.cvtColor(
                 np.array(
-                    pyautogui.screenshot(region=(self.game_left, self.game_top, self.game_width, self.game_height))
+                    self.window_service.screenshot(region=(self.game_left, self.game_top, self.game_width, self.game_height))
                 ),
                 cv2.COLOR_RGB2BGR,
             )
@@ -1452,6 +1452,7 @@ def launch_floating_window(config_store, state, window_service):
         nonlocal selector_win
         state.stop_requested = True
         window_service.shutdown_input()
+        window_service.shutdown_capture()
         if overlay.is_open():
             overlay.cancel()
         if all_overlay.is_open():

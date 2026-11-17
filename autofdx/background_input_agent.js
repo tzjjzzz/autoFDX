@@ -59,15 +59,48 @@ const releaseCallback = new NativeCallback(function() {
 }, 'int', []);
 callbacks.push(releaseCallback);
 Interceptor.replace(releaseAddress, releaseCallback);
+// Real WM_ACTIVATEAPP is often sent synchronously by Windows, bypassing
+// DispatchMessage. Observe the actual target WndProc as well as posted messages.
+let wndProcHook = null;
+let hookedWndProc = null;
+const activationStats = {deactivations:0, activations:0, wndProcObserved:false};
+function observeActivation(message, wp) {
+    if (message === 0x001c) {
+        const active = !wp.isNull();
+        needsActivation = !active;
+        if (active) activationStats.activations++;
+        else { activationStats.deactivations++; captures.clear(); }
+    } else if (message === 0x0008 || (message === 0x0006 && (wp.toUInt32() & 0xffff) === 0)) {
+        needsActivation = true;
+        captures.clear();
+    }
+}
+const getWndProc = new NativeFunction(
+    u.getExportByName(Process.pointerSize === 8 ? 'GetWindowLongPtrW' : 'GetWindowLongW'),
+    'pointer', ['pointer','int']);
+function watchWndProc() {
+    const address = getWndProc(target, -4); // GWLP_WNDPROC, no game offsets.
+    if (address.isNull()) throw new Error('Target WndProc is unavailable');
+    if (hookedWndProc !== null && hookedWndProc.equals(address)) return;
+    if (wndProcHook !== null) wndProcHook.detach();
+    wndProcHook = Interceptor.attach(address, {
+        onEnter(args) {
+            if (enabled && args[0].equals(target))
+                observeActivation(args[1].toUInt32(), args[2]);
+        }
+    });
+    hookedWndProc = address;
+    activationStats.wndProcObserved = true;
+}
 for (const name of ['DispatchMessageW', 'DispatchMessageA']) {
     Interceptor.attach(u.getExportByName(name), {
         onEnter(args) {
             if (!enabled) return;
             try {
                 const msg = args[0];
-                if (msg.readPointer().equals(target) && msg.add(Process.pointerSize).readU32() === 0x001c) {
+                if (msg.readPointer().equals(target)) {
                     const off = Process.pointerSize === 8 ? 16 : 8;
-                    needsActivation = msg.add(off).readPointer().isNull();
+                    observeActivation(msg.add(Process.pointerSize).readU32(), msg.add(off).readPointer());
                 }
             } catch(e) { send({kind:'error', detail:String(e)}); }
         }
@@ -118,11 +151,13 @@ callbacks.push(rawCallback);
 Interceptor.replace(rawAddress, rawCallback);
 
 rpc.exports = {
-    configure(hwnd) { target = ptr(hwnd); enabled = false; needsActivation = true; },
+    configure(hwnd) { target = ptr(hwnd); enabled = false; needsActivation = true; watchWndProc(); },
     prepare(x, y) {
+        watchWndProc();
         xy = {x:x, y:y}; enabled = true;
         return needsActivation;
     },
+    activationStatus() { return Object.assign({needsActivation:needsActivation}, activationStats); },
     queueRaw(dx, dy) {
         if(!enabled)throw new Error('input bridge is not armed');
         if(!Number.isInteger(dx)||!Number.isInteger(dy)||Math.abs(dx)>2147483647||Math.abs(dy)>2147483647)

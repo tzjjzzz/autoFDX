@@ -83,6 +83,7 @@ def main():
     state = RuntimeState()
     window_service = WindowService(config_store)
     atexit.register(window_service.shutdown_input)
+    atexit.register(window_service.shutdown_capture)
     vision_service = VisionService(config_store, state, window_service)
     actions = GameActions(config_store, state, window_service, vision_service)
     engine = AutomationEngine(config_store, state, window_service, vision_service, actions)
@@ -98,6 +99,7 @@ def main():
     finally:
         state.stop_requested = True
         window_service.shutdown_input()
+        window_service.shutdown_capture()
 
     # 悬浮窗 on_exit 已置 stop_requested；此处再写一次，防止其它路径关闭窗口时遗漏。
     state.stop_requested = True

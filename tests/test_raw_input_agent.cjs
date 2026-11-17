@@ -12,6 +12,7 @@ for (const pointerSize of [4, 8]) {
         compare(p) { return this.n < p.n ? -1 : this.n > p.n ? 1 : 0; }
         equals(p) { return this.n === p.n; }
         isNull() { return this.n === 0n; }
+        toUInt32() { return Number(this.n & 0xffffffffn); }
         toString() { return '0x' + this.n.toString(16); }
         region() {
             const row = regions.find(r => this.n >= r.base && this.n < r.base + BigInt(r.buffer.length));
@@ -32,17 +33,42 @@ for (const pointerSize of [4, 8]) {
     const ptr = n => new Pointer(n);
     const memory = {alloc(n) { const p=ptr(next);regions.push({base:next,buffer:Buffer.alloc(n)});next+=BigInt(n+32);return p; }};
     const replacements = {};
+    const hooks = {};
     const context = {
         ptr, Memory:memory, Process:{pointerSize,mainModule:{base:ptr(0x400000),size:0x10000},
             getCurrentThreadId:()=>1,getModuleByName:()=>({getExportByName:n=>n})},
-        Interceptor:{attach:()=>{},replace:(name,cb)=>replacements[name]=cb},
+        Interceptor:{attach:(name,cb)=>{hooks[String(name)]=cb;return {detach(){}};},replace:(name,cb)=>replacements[name]=cb},
         NativeCallback:function(fn){return fn;},
-        NativeFunction:function(){return ()=>0xeeee;},
+        NativeFunction:function(name){return name === 'GetWindowLongPtrW' || name === 'GetWindowLongW' ? ()=>ptr(0x401000) : ()=>0xeeee;},
         rpc:{exports:{}}, send:()=>{}, Date,
     };
     vm.runInNewContext(source,context);
     const rpc=context.rpc.exports;
-    rpc.configure('0x100');rpc.prepare(100,100);
+    rpc.configure('0x100');
+    assert.equal(rpc.prepare(100,100),true);
+    // Synchronous OS notifications enter WndProc without DispatchMessage.
+    const proc=hooks['0x401000'];
+    proc.onEnter([ptr(0x100),ptr(0x1c),ptr(1)]);
+    assert.equal(rpc.prepare(100,100),false);
+    // Existing capture must not survive a real deactivation.
+    replacements.SetCapture.call({returnAddress:ptr(0x400100)},ptr(0x100));
+    const ctx={returnAddress:ptr(0x400100)};
+    hooks.GetCapture.onEnter.call(ctx);
+    let captureReturn=null;
+    hooks.GetCapture.onLeave.call(ctx,{replace:p=>captureReturn=p.toString()});
+    assert.equal(captureReturn,'0x100');
+    proc.onEnter([ptr(0x100),ptr(0x1c),ptr(0)]);
+    assert.equal(rpc.prepare(100,100),true);
+    captureReturn=null;
+    hooks.GetCapture.onEnter.call(ctx);
+    hooks.GetCapture.onLeave.call(ctx,{replace:p=>captureReturn=p.toString()});
+    assert.equal(captureReturn,null);
+    proc.onEnter([ptr(0x100),ptr(0x1c),ptr(1)]);
+    proc.onEnter([ptr(0x999),ptr(0x1c),ptr(0)]);
+    assert.equal(rpc.prepare(100,100),false);
+    proc.onEnter([ptr(0x100),ptr(8),ptr(0)]);
+    assert.equal(rpc.prepare(100,100),true);
+    assert.equal(rpc.activationStatus().wndProcObserved,true);
     const header=pointerSize===8?24:16;
     const total=header+24;
     const token=rpc.queueRaw(5000,-20);

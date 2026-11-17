@@ -1,4 +1,4 @@
-> 本实验分支已将 Windows 游戏输入切换为后台 Hook；安装、限制与验证步骤见 [后台输入说明](docs/background-input.md)。截图仍需游戏可见、未被遮挡。
+> 本实验分支已将 Windows 游戏输入切换为后台 Hook；安装、限制与验证步骤见 [后台输入说明](docs/background-input.md)。截图已切换为按 HWND 的 WGC，支持遮挡捕获；跨桌面需持续出帧，最小化不保证可用。
 
 # autoFDX（Fallen Doll 自动化）
 

@@ -128,6 +128,7 @@ class BackgroundInput:
         self._active = False
         self._fault = None
         self._activation_time = 0.0
+        self._last_foreground = None
         self._closed = False
 
     def _message(self, message, data):
@@ -173,7 +174,7 @@ class BackgroundInput:
                 raise InputUnavailable(f"Background hook attachment failed: {exc}") from exc
         return identity[0]
 
-    def _prepare(self):
+    def _prepare(self, force_activation=False):
         hwnd = self._ensure()
         x, y = self._position
         width, height = self._api.client_size(hwnd)
@@ -182,7 +183,13 @@ class BackgroundInput:
         sx, sy = self._api.screen(hwnd, x, y)
         # Re-arm if a real Alt-Tab generated a new deactivation since our last action.
         needs_activation = self._script.exports_sync.prepare(sx, sy)
-        if not self._active or needs_activation:
+        foreground = self._api.foreground()
+        returned_to_background = self._last_foreground == hwnd and foreground != hwnd
+        self._last_foreground = foreground
+        # A click is a transaction: refresh Slate activation even if a sent
+        # deactivation was missed or a hook provider changed the WndProc.
+        if (not self._active or needs_activation or returned_to_background
+                or (force_activation and foreground != hwnd)):
             self._active = True  # cleanup even if posting fails
             self._api.post(hwnd, 0x001c, 1, self._api.foreground_thread())
             self._activation_time = monotonic()
@@ -258,7 +265,7 @@ class BackgroundInput:
 
     def left_click(self, hold=None):
         with self._lock:
-            hwnd = self._prepare()
+            hwnd = self._prepare(force_activation=True)
             lp = packed_point(*self._position)
             self._api.post(hwnd, 0x0200, 0, lp)
             sleep(0.03)
@@ -345,6 +352,7 @@ class BackgroundInput:
         if session is not None:
             attempt("detach", session.detach)
         self._identity = self._position = None
+        self._last_foreground = None
         self._pressed.clear()
         self._mouse_down = self._active = False
         self._fault = None

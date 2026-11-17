@@ -8,6 +8,7 @@ import pyautogui
 from .config import PROJECT_ROOT, TEMPLATES_DIR
 from . import log_codes as C
 from .run_log import log, log_debug
+from .window_capture import CaptureUnavailable
 
 # 赞池：环形分为若干充能格，用「有蓝的格数/总格数」统计，分隔线不计入填充。
 LIKE_POOL_SEGMENT_COUNT = 10
@@ -211,7 +212,7 @@ class VisionService:
             sx2 = min(width, x2 + margin)
             sy2 = min(height, y2 + margin)
             if sx2 > sx1 and sy2 > sy1:
-                local_img = pyautogui.screenshot(region=(left + sx1, top + sy1, sx2 - sx1, sy2 - sy1))
+                local_img = self.window_service.screenshot(region=(left + sx1, top + sy1, sx2 - sx1, sy2 - sy1))
                 local_gray = cv2.cvtColor(np.array(local_img), cv2.COLOR_RGB2GRAY)
                 best_center, best_val = self._match_with_template(local_gray, template, ac, sx1, sy1)
                 if best_center is not None:
@@ -243,7 +244,7 @@ class VisionService:
                 return None
 
         # 未标定区域时，才回退到全窗口截图匹配（兼容首次使用）。
-        img = pyautogui.screenshot(region=(left, top, width, height))
+        img = self.window_service.screenshot(region=(left, top, width, height))
         img_gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
         global_center, global_val = self._match_with_template(img_gray, template, max(0.75, ac * 0.95), 0, 0)
         if global_center is not None:
@@ -276,7 +277,7 @@ class VisionService:
 
     def capture_screen(self):
         return cv2.cvtColor(
-            np.array(pyautogui.screenshot(region=self.window_service.get_window_region())),
+            np.array(self.window_service.screenshot(region=self.window_service.get_window_region())),
             cv2.COLOR_RGB2BGR,
         )
 
@@ -320,7 +321,9 @@ class VisionService:
         if ow < 4 or oh < 4:
             return None
         try:
-            shot = pyautogui.screenshot(region=(int(left + ox1), int(top + oy1), int(ow), int(oh)))
+            shot = self.window_service.screenshot(region=(int(left + ox1), int(top + oy1), int(ow), int(oh)))
+        except CaptureUnavailable:
+            raise
         except Exception:
             return None
         crop = cv2.cvtColor(np.asarray(shot), cv2.COLOR_RGB2BGR)
@@ -513,7 +516,7 @@ class VisionService:
         if x2 <= x1 or y2 <= y1:
             return None, x1, y1
         left, top, _, _ = self.window_service.get_window_region()
-        shot = pyautogui.screenshot(region=(left + x1, top + y1, x2 - x1, y2 - y1))
+        shot = self.window_service.screenshot(region=(left + x1, top + y1, x2 - x1, y2 - y1))
         return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR), x1, y1
 
     def get_sensitive_progress_bar_ratio(self):
@@ -613,6 +616,8 @@ class VisionService:
                     matched.append(name)
             except FileNotFoundError:
                 continue
+            except CaptureUnavailable:
+                raise
             except Exception:
                 continue
         return matched
