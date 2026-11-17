@@ -827,11 +827,19 @@ class AutomationEngine:
             for _ in range(batch):
                 if (not self._scroll_enabled) or self.state.manual_pause or self._scroll_stop_event.is_set():
                     break
-                inp = self.actions._inp()
-                if inp is not None:
-                    inp.scroll(amount)
-                else:
-                    pyautogui.scroll(amount)
+                try:
+                    inp = self.actions._inp()
+                    if inp is not None:
+                        inp.scroll(amount)
+                    else:
+                        pyautogui.scroll(amount)
+                except Exception as exc:
+                    self._clear_scroll_command()
+                    self.state.manual_pause = True
+                    self.state.set_status(f"后台输入异常: {exc}")
+                    log(C.SYS001, err=exc)
+                    self.actions.close_input()
+                    break
 
     def _start_scroll_worker(self):
         if self._scroll_thread is None or (not self._scroll_thread.is_alive()):
@@ -868,6 +876,7 @@ class AutomationEngine:
 
         self.state.manual_pause = not self.state.manual_pause
         if self.state.manual_pause:
+            self.actions.close_input()
             self.state.set_status("F1紧急暂停")
             log(C.HK001, action="pause")
         else:
@@ -893,6 +902,8 @@ class AutomationEngine:
         if self.state.stop_requested or self.state.pending_calibration is not None:
             return True
 
+        if self.state.manual_pause:
+            self.actions.close_input()
         while self.state.manual_pause:
             if self.state.stop_requested or self.state.pending_calibration is not None:
                 return True
@@ -2186,6 +2197,7 @@ class AutomationEngine:
             while not self.state.stop_requested:
                 self._poll_home_page_scene()
                 if self.state.manual_pause:
+                    self.actions.close_input()
                     if self.state.current_status not in (
                         "F1紧急暂停",
                         "标定中",
@@ -2201,6 +2213,7 @@ class AutomationEngine:
                 except Exception as exc:
                     self.state.set_status(f"异常: {exc}")
                     log(C.SYS001, err=exc)
+                    self.actions.close_input()
                     _sleep_interruptible(1.0, self.state)
         finally:
             log(
@@ -2216,3 +2229,4 @@ class AutomationEngine:
             self._stop_female_bar_monitor()
             self._stop_special_action_monitor()
             self._unregister_hotkeys()
+            self.window_service.shutdown_input()

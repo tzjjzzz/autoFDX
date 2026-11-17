@@ -1,3 +1,7 @@
+import sys
+import threading
+from contextlib import contextmanager
+
 import pyautogui
 
 from .config import WINDOW_TITLE
@@ -8,6 +12,9 @@ class WindowService:
 
     def __init__(self, config_store):
         self.config_store = config_store
+        self._input = None
+        self._input_lock = threading.RLock()
+        self._input_shutdown = False
 
     @property
     def config(self):
@@ -37,3 +44,37 @@ class WindowService:
     def denormalize_point(self, point):
         left, top, width, height = self.get_window_region()
         return int(left + point[0] * width), int(top + point[1] * height)
+
+    def get_input(self):
+        """Shared by automation and calibration; no duplicate Frida sessions."""
+        if sys.platform != "win32":
+            return None
+        with self._input_lock:
+            if self._input_shutdown:
+                raise RuntimeError("Input service is shut down")
+            if self._input is None:
+                from .background_input import BackgroundInput
+                self._input = BackgroundInput(lambda: self.get_game_window()._hWnd)
+            return self._input
+
+    def close_input(self):
+        with self._input_lock:
+            if self._input is not None:
+                return self._input.close()
+        return []
+
+    def shutdown_input(self):
+        with self._input_lock:
+            self._input_shutdown = True
+            if self._input is not None:
+                return self._input.shutdown()
+        return []
+
+    @contextmanager
+    def input_session(self):
+        """Keep pause/cleanup from splitting calibration move + wheel replay."""
+        with self._input_lock:
+            try:
+                yield self.get_input()
+            finally:
+                self.close_input()

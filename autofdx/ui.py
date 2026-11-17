@@ -939,10 +939,13 @@ class CalibrationOverlay:
             sleep(1.0)
             abs_x = int(self.game_left + ax * self.game_width)
             abs_y = int(self.game_top + ay * self.game_height)
-            pyautogui.moveTo(abs_x, abs_y)
-            # 鼠标到位后稍等，让游戏收到悬停；再按整格滚轮发送（1档=10滚轮单位）。
-            sleep(0.2)
-            scroll_down_by_units(distance * 10.0)
+            with self.window_service.input_session() as inp:
+                if inp is not None:
+                    inp.move_to(abs_x, abs_y)
+                else:
+                    pyautogui.moveTo(abs_x, abs_y)
+                sleep(0.2)
+                scroll_down_by_units(distance * 10.0, input_backend=inp)
         # 标定完成后不自动恢复，等待用户点“继续运行”再进入自动流程。
         self.state.calibration_updated = True
         self.state.manual_pause = True
@@ -1433,6 +1436,7 @@ def launch_floating_window(config_store, state, window_service):
         was_paused = state.manual_pause
         state.manual_pause = not state.manual_pause
         if state.manual_pause:
+            window_service.close_input()
             state.set_status("手动暂停")
         else:
             # 点击继续运行时，清除“新标定待应用”标记；运行逻辑会直接使用最新配置。
@@ -1447,6 +1451,7 @@ def launch_floating_window(config_store, state, window_service):
     def on_exit():
         nonlocal selector_win
         state.stop_requested = True
+        window_service.shutdown_input()
         if overlay.is_open():
             overlay.cancel()
         if all_overlay.is_open():

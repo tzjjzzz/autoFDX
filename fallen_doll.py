@@ -82,6 +82,7 @@ def main():
 
     state = RuntimeState()
     window_service = WindowService(config_store)
+    atexit.register(window_service.shutdown_input)
     vision_service = VisionService(config_store, state, window_service)
     actions = GameActions(config_store, state, window_service, vision_service)
     engine = AutomationEngine(config_store, state, window_service, vision_service, actions)
@@ -92,7 +93,11 @@ def main():
     worker.start()
     atexit.register(_release_keyboard_hooks_safely)
 
-    launch_floating_window(config_store, state, window_service)
+    try:
+        launch_floating_window(config_store, state, window_service)
+    finally:
+        state.stop_requested = True
+        window_service.shutdown_input()
 
     # 悬浮窗 on_exit 已置 stop_requested；此处再写一次，防止其它路径关闭窗口时遗漏。
     state.stop_requested = True

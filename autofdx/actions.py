@@ -11,292 +11,24 @@ import pyautogui
 from . import log_codes as C
 from .run_log import log, log_debug
 
-# ---------------------------------------------------------------------------
-# SendInput 底层鼠标移动（仅 Windows）
-# 结构体布局必须与 WinUser.h 一致，否则 SendInput 返回 0。
-# ---------------------------------------------------------------------------
-if sys.platform == "win32":
-    _ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint32
-
-    _INPUT_MOUSE = 0
-    _MOUSEEVENTF_MOVE = 0x0001
-    _MOUSEEVENTF_LEFTDOWN = 0x0002
-    _MOUSEEVENTF_LEFTUP = 0x0004
-    _MOUSEEVENTF_WHEEL = 0x0800
-    _WHEEL_DELTA = 120
-
-    _user32 = ctypes.WinDLL("user32", use_last_error=True)
-
-    class _MOUSEINPUT(ctypes.Structure):
-        _fields_ = (
-            ("dx", wintypes.LONG),
-            ("dy", wintypes.LONG),
-            ("mouseData", wintypes.DWORD),
-            ("dwFlags", wintypes.DWORD),
-            ("time", wintypes.DWORD),
-            ("dwExtraInfo", _ULONG_PTR),
-        )
-
-    class _KEYBDINPUT(ctypes.Structure):
-        _fields_ = (
-            ("wVk", wintypes.WORD),
-            ("wScan", wintypes.WORD),
-            ("dwFlags", wintypes.DWORD),
-            ("time", wintypes.DWORD),
-            ("dwExtraInfo", _ULONG_PTR),
-        )
-
-    class _HARDWAREINPUT(ctypes.Structure):
-        _fields_ = (
-            ("uMsg", wintypes.DWORD),
-            ("wParamL", wintypes.WORD),
-            ("wParamH", wintypes.WORD),
-        )
-
-    class _INPUT_UNION(ctypes.Union):
-        _fields_ = (
-            ("mi", _MOUSEINPUT),
-            ("ki", _KEYBDINPUT),
-            ("hi", _HARDWAREINPUT),
-        )
-
-    class _INPUT(ctypes.Structure):
-        _fields_ = (
-            ("type", wintypes.DWORD),
-            ("u", _INPUT_UNION),
-        )
-
-    _INPUT_SIZE = ctypes.sizeof(_INPUT)
-    _user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
-    _user32.SendInput.restype = wintypes.UINT
-    _user32.GetForegroundWindow.restype = wintypes.HWND
-    _user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
-    _user32.IsIconic.argtypes = (wintypes.HWND,)
-    _user32.IsWindow.argtypes = (wintypes.HWND,)
-    _user32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
-    _user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
-
-    def _send_relative_move(dx: int, dy: int) -> bool:
-        """通过 SendInput 注入一次相对鼠标移动事件。"""
-        inp = _INPUT()
-        inp.type = _INPUT_MOUSE
-        inp.u.mi = _MOUSEINPUT(int(dx), int(dy), 0, _MOUSEEVENTF_MOVE, 0, _ULONG_PTR(0))
-        sent = _user32.SendInput(1, ctypes.byref(inp), _INPUT_SIZE)
-        if sent != 1:
-            err = ctypes.get_last_error()
-            log(C.SYS003, sent=sent, err=err)
-            return False
-        return True
-
-    def _send_left_click(hold_sec: float = 0.0) -> None:
-        """
-        SendInput 左键按下/抬起。
-        hold_sec>0 时在按下与抬起之间保持一段时间：游戏按帧轮询鼠标状态，
-        按下/抬起落在同一帧内会被漏掉（表现为“点了没反应”）。
-        """
-        for flag in (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP):
-            inp = _INPUT()
-            inp.type = _INPUT_MOUSE
-            inp.u.mi = _MOUSEINPUT(0, 0, 0, flag, 0, _ULONG_PTR(0))
-            sent = _user32.SendInput(1, ctypes.byref(inp), _INPUT_SIZE)
-            if sent != 1:
-                err = ctypes.get_last_error()
-                log(C.SYS003, sent=sent, err=err, kind="click")
-                return
-            if flag == _MOUSEEVENTF_LEFTDOWN and hold_sec > 0:
-                sleep(hold_sec)
-
-    def _send_wheel(delta: int) -> bool:
-        """
-        SendInput 注入一次滚轮事件。
-
-        pyautogui.scroll 在 Windows 上把参数原样当作 wheelData；游戏通常按
-        WHEEL_DELTA(120) 为一格解析，小于 120 的事件（如 -10）会被忽略，
-        因此实验列表需要以「整格」为单位发送。delta<0 为向下滚动。
-        """
-        inp = _INPUT()
-        inp.type = _INPUT_MOUSE
-        # mouseData 为 DWORD，负数需按补码传入。
-        inp.u.mi = _MOUSEINPUT(0, 0, int(delta) & 0xFFFFFFFF, _MOUSEEVENTF_WHEEL, 0, _ULONG_PTR(0))
-        sent = _user32.SendInput(1, ctypes.byref(inp), _INPUT_SIZE)
-        if sent != 1:
-            err = ctypes.get_last_error()
-            log(C.SYS003, sent=sent, err=err, kind="wheel")
-            return False
-        return True
-
-    def _bring_window_to_front(hwnd) -> bool:
-        """把游戏窗口置前并返回是否成功（用 Alt 轻点绕过前台锁）。"""
-        try:
-            if _user32.GetForegroundWindow() == hwnd:
-                return True
-            if _user32.IsIconic(hwnd):
-                _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            _user32.keybd_event(0x12, 0, 0, 0)  # Alt down
-            _user32.keybd_event(0x12, 0, 2, 0)  # Alt up
-            _user32.SetForegroundWindow(hwnd)
-            sleep(0.15)
-            return _user32.GetForegroundWindow() == hwnd
-        except Exception:
-            return False
-else:
-    def _send_wheel(delta: int) -> bool:
-        pyautogui.scroll(int(delta))
-        return True
-
-    def _bring_window_to_front(hwnd) -> bool:
-        return False
-
-    def _send_relative_move(dx: int, dy: int) -> bool:
-        """非 Windows 回退：用 pyautogui 模拟。"""
-        pyautogui.moveRel(dx, dy)
-        return True
-
-    def _send_left_click(hold_sec: float = 0.0) -> None:
-        pyautogui.leftClick()
-
-
-def scroll_down_by_units(total_units, notch_pause_sec=0.04):
-    """
-    向下滚动 total_units 个「滚轮单位」（标定约定：1档=10单位）。
-    以整格(WHEEL_DELTA=120)发送、至少 1 格，返回实际发送的格数。
-    标定确认时的回放与运行时重播共用此函数，保证行为一致。
-    """
+def scroll_down_by_units(total_units, notch_pause_sec=0.04, input_backend=None):
+    """Replay calibrated raw wheel units: 120 units per notch, minimum one."""
     try:
         units = max(0, int(round(float(total_units))))
-    except Exception:
+    except (TypeError, ValueError):
         units = 0
     if units <= 0:
         return 0
     notches = max(1, int(round(units / 120.0)))
+    if sys.platform == "win32" and input_backend is None:
+        raise RuntimeError("A target-window input backend is required for Windows scrolling")
     for _ in range(notches):
-        _send_wheel(-120)
+        if input_backend is not None:
+            input_backend.scroll(-120)
+        else:
+            pyautogui.scroll(-120)
         sleep(max(0.0, float(notch_pause_sec)))
     return notches
-
-
-class RobustInput:
-    """
-    Windows 下的可靠输入后端（供 GameActions._inp() 返回）。
-
-    pyautogui 的 keybd_event/mouse_event 是“瞬发”的：按下抬起同帧、不带真实鼠标移动事件、
-    也不关心键盘焦点在哪，游戏经常漏掉。这里统一做到：
-    1) 每次注入前确保游戏窗口在前台（首次启动时焦点还在悬浮窗）；
-    2) 移动鼠标时补发真实的相对移动事件，让游戏刷新悬停/射线；
-    3) 点击、按键都带按住时长，保证至少跨过一帧；
-    4) 滚轮按整格(120)发送。
-    """
-
-    CLICK_HOLD_SEC = 0.05
-    KEY_HOLD_SEC = 0.06
-
-    def __init__(self, hwnd_getter):
-        self._hwnd_getter = hwnd_getter
-        self._hwnd = None
-        self._hwnd_t = 0.0
-
-    # --- 焦点 ---
-    def _game_hwnd(self):
-        now = monotonic()
-        if self._hwnd and (now - self._hwnd_t) < 2.0 and _user32.IsWindow(self._hwnd):
-            return self._hwnd
-        try:
-            self._hwnd = self._hwnd_getter()
-        except Exception:
-            self._hwnd = None
-        self._hwnd_t = now
-        return self._hwnd
-
-    def ensure_focus(self, settle_sec=0.2):
-        """游戏已在前台则几乎零开销；否则置前并等待 settle_sec。"""
-        hwnd = self._game_hwnd()
-        if not hwnd:
-            return False
-        try:
-            if _user32.GetForegroundWindow() == hwnd:
-                return True
-        except Exception:
-            return False
-        ok = _bring_window_to_front(hwnd)
-        sleep(max(0.0, float(settle_sec)))
-        return bool(ok)
-
-    # --- 鼠标 ---
-    def nudge(self, px=3):
-        """原地来回抖动 px 像素，产生真实移动事件但不改变最终位置。"""
-        _send_relative_move(int(px), 0)
-        sleep(0.02)
-        _send_relative_move(-int(px), 0)
-        sleep(0.02)
-
-    def move_to(self, x, y):
-        self.ensure_focus()
-        x, y = int(x), int(y)
-        _user32.SetCursorPos(x, y)
-        sleep(0.01)
-        self.nudge(2)
-        _user32.SetCursorPos(x, y)  # 抖动后校正到精确位置
-        sleep(0.02)
-
-    def move_rel(self, dx, dy=0, duration=0.0):
-        dx, dy = int(dx), int(dy)
-        steps = max(1, int(float(duration) / 0.01)) if duration and duration > 0 else 1
-        done_x = done_y = 0
-        for i in range(1, steps + 1):
-            tx = round(dx * i / steps)
-            ty = round(dy * i / steps)
-            sx, sy = tx - done_x, ty - done_y
-            if sx or sy:
-                _send_relative_move(sx, sy)
-            done_x, done_y = tx, ty
-            if duration and duration > 0:
-                sleep(float(duration) / steps)
-
-    def left_click(self, hold=None):
-        self.ensure_focus()
-        _send_left_click(self.CLICK_HOLD_SEC if hold is None else float(hold))
-
-    def click(self, clicks=1, interval=0.08):
-        for i in range(max(1, int(clicks))):
-            self.left_click()
-            if i < clicks - 1:
-                sleep(max(0.0, float(interval)))
-
-    def scroll(self, amount, x=None, y=None):
-        """amount 为原始滚轮量（正=向上，负=向下）；高频调用，不做焦点检查。"""
-        if x is not None and y is not None:
-            self.move_to(x, y)
-        _send_wheel(int(amount))
-
-    # --- 键盘 ---
-    def press(self, key, hold=None):
-        self.ensure_focus()
-        hold_sec = self.KEY_HOLD_SEC if hold is None else float(hold)
-        try:
-            keyboard.press(key)
-            sleep(max(0.01, hold_sec))
-            keyboard.release(key)
-            return True
-        except Exception:
-            try:
-                pyautogui.keyDown(key)
-                sleep(max(0.01, hold_sec))
-                pyautogui.keyUp(key)
-                return True
-            except Exception:
-                return False
-
-    def press_after_delay(self, key, delay_sec=0.0, abort_check=None, repeat=1, interval=0.0):
-        if delay_sec and delay_sec > 0:
-            sleep(float(delay_sec))
-        for i in range(max(1, int(repeat))):
-            if abort_check and abort_check():
-                return False
-            self.press(key)
-            if i < repeat - 1:
-                sleep(max(0.0, float(interval)))
-        log(C.SA004, n=repeat, interval=interval)
-        return True
 
 
 class GameActions:
@@ -314,7 +46,6 @@ class GameActions:
         self.window_service = window_service
         self.vision_service = vision_service
         self._last_special_action_red_info = {}
-        self._robust_input = None
 
     def _game_hwnd_or_none(self):
         try:
@@ -323,12 +54,13 @@ class GameActions:
             return None
 
     def _inp(self):
-        """Windows 下返回可靠输入后端；其它平台返回 None（回退 pyautogui）。"""
+        """Windows background input; failures never fall back to physical input."""
         if sys.platform != "win32":
             return None
-        if self._robust_input is None:
-            self._robust_input = RobustInput(self._game_hwnd_or_none)
-        return self._robust_input
+        return self.window_service.get_input()
+
+    def close_input(self):
+        self.window_service.close_input()
 
     def move_mouse_to(self, x, y):
         """统一的“移动鼠标到绝对坐标”入口（供 automation.py 使用）。"""
@@ -353,10 +85,18 @@ class GameActions:
             pyautogui.leftClick()
 
     def _move_rel(self, dx: int, dy: int) -> bool:
-        return _send_relative_move(dx, dy)
+        inp = self._inp()
+        if inp is not None:
+            return inp.move_rel(dx, dy)
+        pyautogui.moveRel(dx, dy)
+        return True
 
     def _left_click_sendinput(self) -> None:
-        _send_left_click(0.03)
+        inp = self._inp()
+        if inp is not None:
+            inp.left_click(hold=0.03)
+        else:
+            pyautogui.leftClick()
 
     def reset_dynamic_learned_regions(self):
         """清空赞池圆心等动态区域（特殊动作判红始终用用户标定框）。"""
@@ -1410,12 +1150,12 @@ class GameActions:
             return False
         try:
             sleep(max(0.0, float(delay_sec)))
-            self.focus_game_window()
-            x, y = self.window_service.denormalize_point([ax, ay])
-            self.move_mouse_to(x, y)
-            # 鼠标到位后停一下，游戏需要先收到悬停才会把滚轮交给列表。
-            sleep(0.2)
-            notches = scroll_down_by_units(distance * 10.0)
+            with self.window_service.input_session() as inp:
+                x, y = self.window_service.denormalize_point([ax, ay])
+                self.move_mouse_to(x, y)
+                # Keep coordinate and wheel replay in the same session even while paused.
+                sleep(0.2)
+                notches = scroll_down_by_units(distance * 10.0, input_backend=inp)
             settled, waited = self.wait_experiment_list_settled()
             log(C.SC001, x=round(ax, 3), y=round(ay, 3), down=distance, notches=notches)
             log(C.SC002, settled=int(settled), waited=round(waited, 2))
